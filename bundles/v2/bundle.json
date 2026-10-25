@@ -1,0 +1,33 @@
+{
+  "name": "v2",
+  "model_class": "MeshGraphNet",
+  "architecture": {"node_width": 9, "edge_width": 4, "hidden_width": 128,
+                   "message_rounds": 8, "output_width": 1},
+  "load_cases": ["ver"],
+  "predicts": "von Mises stress per surface node, MPa",
+  "target_transform": "log1p, then standardise with scaling.npz",
+  "node_features": ["is_ordinary", "is_clamped", "is_loaded", "normal_x", "normal_y",
+                    "normal_z", "sharpness", "distance_to_clamp", "distance_to_load"],
+  "edge_features": ["step_x", "step_y", "step_z", "step_length"],
+  "landmark_tolerance_mm": 5.0,
+  "lineage": {
+    "code": {
+      "repo": "https://github.com/Vedavamsi-3/simjeb-stress-surrogate",
+      "git_commit": "284263a"
+    },
+    "data": {
+      "dataset": "SimJEB",
+      "split_file": "training/split.json",
+      "split_seed": 0,
+      "train_brackets": 232,
+      "val_brackets": 50,
+      "test_brackets": 50,
+      "scaling_fitted_on": "train"
+    },
+    "training_run": {
+      "run": "v2",
+      "settings_file": "training/settings.json",
+      "best_epoch": 194
+    }
+  }
+}

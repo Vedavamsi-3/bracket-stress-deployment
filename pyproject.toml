@@ -1,0 +1,8 @@
+[project]
+name = "surrogate"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = ["torch", "torch_geometric", "meshio", "scipy", "numpy", "pandas"]
+
+[tool.setuptools]
+packages = ["surrogate", "surrogate.io"]

@@ -1,0 +1,261 @@
+"""The network: a MeshGraphNet, encode - process - decode.
+
+Reference: Pfaff, Fortunato, Sanchez-Gonzalez & Battaglia, *Learning Mesh-Based
+Simulation with Graph Networks*, ICLR 2021.
+
+Adapted in two ways, both worth being able to state plainly:
+
+  * MeshGraphNets predicts the NEXT state and rolls forward through time. A
+    linear-static solve has no time dimension, so this predicts the field
+    directly in one shot.
+  * MeshGraphNets carries two edge types because it handles contact and
+    self-collision. Nothing here collides, so there is one.
+
+Why this family of network at all
+---------------------------------
+Stress comes from strain, and strain is a spatial derivative of displacement. A
+derivative is built from differences between neighbouring points - exactly what
+a message carrying ``x_j - x_i`` lets a layer compute. A graph network without
+edge FEATURES (GCN, GraphSAGE, GAT) can record that two nodes are connected but
+not how far apart or in which direction, so it cannot represent the derivative
+at all. That is a requirement, not a preference, and it is what selects this
+architecture.
+
+Inputs are expected already scaled - see :mod:`simjeb.scaling`. The model owns
+no statistics of its own, so a checkpoint plus its saved scalers fully
+determine what it will predict.
+
+Run on its own::
+
+    python -m simjeb.model
+"""
+
+from pathlib import Path
+
+import torch
+import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
+from torch_geometric.utils import scatter
+
+
+def make_mlp(input_width, output_width, hidden_width, dropout=0.0,
+             layer_norm=True):
+    """The small network used at every point in the model.
+
+    ReLU is what makes depth worth having. Without a bend between the two
+    linear layers they would collapse into a single linear map.
+
+    LayerNorm keeps each stage's output at a steady scale. Stacked eight blocks
+    deep, small drifts compound and training becomes unstable. The decoder
+    leaves it off, because its output is a physical answer rather than an
+    internal state that feeds the next layer.
+    """
+    layers = [nn.Linear(input_width, hidden_width), nn.ReLU()]
+
+    if dropout > 0:
+        layers.append(nn.Dropout(dropout))
+
+    layers.append(nn.Linear(hidden_width, output_width))
+
+    if layer_norm:
+        layers.append(nn.LayerNorm(output_width))
+
+    return nn.Sequential(*layers)
+
+
+class ProcessorBlock(nn.Module):
+    """One round of message passing: update every edge, then every node.
+
+    Each block moves information exactly one step along the mesh, so the number
+    of blocks decides how far a node can see.
+
+    Both updates are residual - the block computes a CHANGE and adds it rather
+    than replacing the state. At this depth that is what makes the network
+    trainable at all, for the same reason ResNet uses them.
+    """
+
+    def __init__(self, hidden_width, dropout=0.0):
+        super().__init__()
+
+        # An edge looks at itself and at the nodes on both of its ends.
+        self.edge_mlp = make_mlp(3 * hidden_width, hidden_width, hidden_width,
+                                 dropout)
+
+        # A node looks at itself and at the sum of the messages arriving.
+        self.node_mlp = make_mlp(2 * hidden_width, hidden_width, hidden_width,
+                                 dropout)
+
+    def forward(self, node_state, edge_state, edge_index):
+        senders = edge_index[0]
+        receivers = edge_index[1]
+
+        # node_state[senders] copies each sender's row out to its edges, so
+        # node data and edge data can sit side by side and be concatenated.
+        edge_input = torch.cat(
+            [edge_state, node_state[senders], node_state[receivers]], dim=1)
+        edge_change = self.edge_mlp(edge_input)
+
+        # Add up the messages arriving at each node.
+        #
+        # SUM, not mean. A node with more neighbours genuinely has more
+        # material attached to it, and averaging would erase that.
+        #
+        # PyTorch Geometric's scatter is used here rather than its
+        # MessagePassing base class, and that is deliberate. MessagePassing
+        # hands back only the aggregated node result, while this block also has
+        # to return the updated EDGE state - so the base class does not fit.
+        # scatter is the piece that does fit, and it is what the production
+        # version of this project uses.
+        gathered = scatter(edge_change, receivers, dim=0,
+                           dim_size=node_state.shape[0], reduce="sum")
+
+        node_input = torch.cat([node_state, gathered], dim=1)
+        node_change = self.node_mlp(node_input)
+
+        return node_state + node_change, edge_state + edge_change
+
+
+class MeshGraphNet(nn.Module):
+    """Encode into a latent width, pass messages, decode to one number.
+
+    Choosing the size
+    -----------------
+    The paper uses 128 wide and 15 blocks. Those do not transfer here, and the
+    reason is worth recording.
+
+    The usual argument for depth is that a node's receptive field should span
+    the load path. Measured on a real SimJEB surface graph, the load lug is 54
+    hops from the nearest bolt hole - so 15 blocks reaches barely a quarter of
+    it, and 54 blocks would need over 10 GB for a single graph. The paper's
+    meshes are an order of magnitude coarser, so hop counts do not carry over.
+
+    Spanning the load path turns out to be the wrong target anyway:
+
+      * stress concentration is LOCAL, set by fillet radii and thickness
+        changes. At about 1 mm mean edge length, 8 hops reaches roughly 8 mm,
+        which covers that length scale.
+      * the GLOBAL context - where a node sits between the clamps and the load
+        - is handed over directly by the two distance features, with no message
+        passing required at all.
+
+    Those two features are therefore load-bearing, not conveniences.
+    """
+
+    def __init__(self, node_width, edge_width=4, hidden_width=64,
+                 message_rounds=8, output_width=1, dropout=0.0,
+                 checkpoint_activations=False):
+        super().__init__()
+
+        self.node_width = node_width
+        self.edge_width = edge_width
+        self.hidden_width = hidden_width
+        self.message_rounds = message_rounds
+        self.output_width = output_width
+        self.checkpoint_activations = checkpoint_activations
+
+        self.node_encoder = make_mlp(node_width, hidden_width, hidden_width)
+        self.edge_encoder = make_mlp(edge_width, hidden_width, hidden_width)
+
+        blocks = []
+        for _ in range(message_rounds):
+            blocks.append(ProcessorBlock(hidden_width, dropout))
+        self.blocks = nn.ModuleList(blocks)
+
+        self.decoder = make_mlp(hidden_width, output_width, hidden_width,
+                                layer_norm=False)
+
+    def forward(self, node_features, edge_index, edge_features):
+        node_state = self.node_encoder(node_features)
+        edge_state = self.edge_encoder(edge_features)
+
+        for block in self.blocks:
+            if self.checkpoint_activations and self.training:
+                # Keep only what ENTERS this block and throw its internals
+                # away, then rebuild them from the weights when the backward
+                # pass arrives back here. Memory stops growing with
+                # MESSAGE_ROUNDS; the cost is one extra forward pass per
+                # block, around 30% more time.
+                #
+                # This is what makes HIDDEN_WIDTH 128 fit on a T4 at all. See
+                # estimate_memory_gb below for the two figures side by side.
+                #
+                # use_reentrant=False is not optional. The older reentrant
+                # version returns a ZERO gradient when no input to the
+                # checkpointed function requires one - and node_features do
+                # not - so the model would train on nothing, silently and
+                # without an error to notice.
+                node_state, edge_state = checkpoint(
+                    block, node_state, edge_state, edge_index,
+                    use_reentrant=False)
+            else:
+                node_state, edge_state = block(node_state, edge_state,
+                                               edge_index)
+
+        return self.decoder(node_state)
+
+    def predict(self, batch):
+        """Convenience wrapper for a :class:`simjeb.batching.Batch`."""
+        return self.forward(batch.node_features, batch.edge_index,
+                            batch.edge_features)
+
+    @property
+    def n_parameters(self):
+        total = 0
+        for parameter in self.parameters():
+            total += parameter.numel()
+        return total
+
+    def describe(self):
+        recompute = " recomputing" if self.checkpoint_activations else ""
+        return (f"MeshGraphNet({self.node_width} node features, "
+                f"{self.edge_width} edge features, {self.hidden_width} wide, "
+                f"{self.message_rounds} rounds{recompute}) - "
+                f"{self.n_parameters:,} parameters")
+
+
+def estimate_memory_gb(n_nodes, n_edges, hidden_width, message_rounds,
+                       bytes_per_number=4, checkpoint_activations=False):
+    """Roughly how much working memory one training step needs, in GB.
+
+    Backpropagation keeps every block's intermediate tensors alive, so memory
+    grows with depth. On these graphs the EDGE tensors dominate - there are
+    about six times as many edges as nodes, and the edge update concatenates
+    three hidden-width tensors across all of them. That is what limits batch
+    size here, far more than in a typical graph network.
+
+    Deliberately approximate: it counts each block's inputs and outputs, not
+    every activation inside the MLPs, so treat it as a floor rather than a
+    prediction. Measure on the real device before fixing a batch size.
+    """
+    per_block = (
+        n_edges * 3 * hidden_width      # the concatenated edge input
+        + n_edges * hidden_width        # the edge update
+        + n_nodes * 2 * hidden_width    # the concatenated node input
+        + n_nodes * hidden_width        # the node update
+    )
+
+    if checkpoint_activations:
+        # Only the two states ENTERING each block survive the forward pass;
+        # everything inside is rebuilt during the backward one, a block at a
+        # time. So the depth term shrinks to the boundaries, and just one
+        # block's full working set is alive on top of them.
+        boundaries = (n_nodes + n_edges) * hidden_width * message_rounds
+        return (boundaries + per_block) * bytes_per_number / 1e9
+
+    return per_block * message_rounds * bytes_per_number / 1e9
+
+
+def build(node_width, config_module):
+    """Make the model the config describes."""
+    return MeshGraphNet(
+        node_width=node_width,
+        edge_width=4,
+        hidden_width=config_module.HIDDEN_WIDTH,
+        message_rounds=config_module.MESSAGE_ROUNDS,
+        output_width=1,
+        dropout=config_module.DROPOUT,
+        checkpoint_activations=getattr(config_module,
+                                       "CHECKPOINT_ACTIVATIONS", False),
+    )
+
+
